@@ -31,8 +31,7 @@ std::optional<timestamp_t> TransactionThreadContext::OldestTransactionStartTime(
   common::SpinLatch::ScopedSpinLatch guard(&curr_running_txns_latch_);
   // If there is no running transactions, return None.
   if (curr_running_txns_.empty()) return std::optional<timestamp_t>();
-  const auto &oldest_txn = std::min_element(curr_running_txns_.cbegin(), curr_running_txns_.cend());
-  return std::optional<timestamp_t>(*oldest_txn);
+  return std::optional<timestamp_t>(*curr_running_txns_.begin());
 }
 
 TransactionQueue TransactionThreadContext::SubmitCompletedTransactions() {

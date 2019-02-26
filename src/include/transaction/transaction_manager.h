@@ -111,6 +111,7 @@ class TransactionManager {
   // Hashmap for registering workers
   std::unordered_map<worker_id_t, TransactionThreadContext *> worker_list_;
   mutable common::SpinLatch worker_list_latch_;
+  TransactionQueue unregistered_completed_txns_;
 
   bool gc_enabled_ = false;
   TransactionQueue completed_txns_;

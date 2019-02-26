@@ -1,6 +1,6 @@
 #pragma once
 #include <optional>
-#include <unordered_set>
+#include <set>
 #include "common/spin_latch.h"
 #include "transaction/transaction_defs.h"
 
@@ -64,7 +64,7 @@ class TransactionThreadContext {
   bool gc_enabled_ = false;
 
   // Use the same data structure as transaction manager to reduce contention
-  std::unordered_set<timestamp_t> curr_running_txns_;
+  std::set<timestamp_t> curr_running_txns_;
   mutable common::SpinLatch curr_running_txns_latch_;
   TransactionQueue worker_completed_txns_;
 };

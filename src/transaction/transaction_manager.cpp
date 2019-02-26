@@ -24,7 +24,7 @@ void TransactionManager::UnregisterWorker(TransactionThreadContext *thread) {
   TransactionThreadContext *victim_worker = item->second;
   auto worker_completed_txns = victim_worker->SubmitCompletedTransactions();
   for (auto txn : worker_completed_txns) {
-    completed_txns_.emplace_front(txn);
+    unregistered_completed_txns_.emplace_front(txn);
   }
 
   delete victim_worker;
@@ -216,12 +216,22 @@ timestamp_t TransactionManager::OldestTransactionStartTime() const {
 TransactionQueue TransactionManager::CompletedTransactionsForGC() {
   TransactionQueue hand_to_gc;
   {
+    // Collect completed transactions from transaction manager
     common::SpinLatch::ScopedSpinLatch guard(&curr_running_txns_latch_);
     hand_to_gc = std::move(completed_txns_);
     TERRIER_ASSERT(completed_txns_.empty(), "TransactionManager's queue should now be empty.");
   }
-  {  // Collected completed transactions from all workers
+  {
     common::SpinLatch::ScopedSpinLatch guard(&worker_list_latch_);
+    // Collect completed transactions from unregistered workers
+    if (!unregistered_completed_txns_.empty()) {
+      for (auto txn : unregistered_completed_txns_) {
+        hand_to_gc.emplace_front(txn);
+      }
+      unregistered_completed_txns_.clear();
+    }
+
+    // Collected completed transactions from registered workers
     for (auto worker : worker_list_) {
       TransactionQueue worker_completed_txns = worker.second->SubmitCompletedTransactions();
       for (auto txn : worker_completed_txns) {
