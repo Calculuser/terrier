@@ -1,4 +1,5 @@
 #pragma once
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include "common/shared_latch.h"
@@ -38,10 +39,7 @@ class TransactionManager {
    * @param worker_id  id of the worker thread to be registered
    * @return a constructed TransactionThreadContext with the given id
    */
-  TransactionThreadContext *RegisterWorker(worker_id_t worker_id) {
-    // TODO(Tianyu): Implement
-    return nullptr;
-  }
+  TransactionThreadContext *RegisterWorker(worker_id_t worker_id);
 
   /**
    * Deregisters a worker to the transaction manager so that we no longer expect transactions to begin
@@ -49,9 +47,8 @@ class TransactionManager {
    *
    * @param thread context of the thread to unregister
    */
-  void UnregisterWorker(TransactionThreadContext *thread) {
-    // TODO(Tianyu): Implement
-  }
+  void UnregisterWorker(TransactionThreadContext *thread);
+
   /**
    * Begins a transaction.
    * @param thread_context context for the calling thread
@@ -110,6 +107,10 @@ class TransactionManager {
   // TODO(Matt): consider a different data structure if this becomes a measured bottleneck
   std::unordered_set<timestamp_t> curr_running_txns_;
   mutable common::SpinLatch curr_running_txns_latch_;
+
+  // Hashmap for registering workers
+  std::unordered_map<worker_id_t, TransactionThreadContext *> worker_list_;
+  mutable common::SpinLatch worker_list_latch_;
 
   bool gc_enabled_ = false;
   TransactionQueue completed_txns_;

@@ -1,8 +1,36 @@
 #include "transaction/transaction_manager.h"
+#include <optional>
 #include <algorithm>
 #include <utility>
 
 namespace terrier::transaction {
+TransactionThreadContext *TransactionManager::RegisterWorker(worker_id_t worker_id) {
+  common::SpinLatch::ScopedSpinLatch guard(&worker_list_latch_);
+  auto worker = new TransactionThreadContext(worker_id, gc_enabled_);
+  worker_list_[worker_id] = worker;
+  return worker;
+}
+
+void TransactionManager::UnregisterWorker(TransactionThreadContext *thread) {
+  common::SpinLatch::ScopedSpinLatch guard(&worker_list_latch_);
+  if (thread == nullptr) return;
+
+  // Use id to find worker in the worker list
+  worker_id_t worker_id = thread->GetWorkerId();
+  auto item = worker_list_.find(worker_id);
+  if (item == worker_list_.end()) return;
+
+  // Collect completed transactions for unregistered worker
+  TransactionThreadContext *victim_worker = item->second;
+  auto worker_completed_txns = victim_worker->SubmitCompletedTransactions();
+  for (auto txn : worker_completed_txns) {
+    completed_txns_.emplace_front(txn);
+  }
+
+  delete victim_worker;
+  worker_list_.erase(item);
+}
+
 TransactionContext *TransactionManager::BeginTransaction(TransactionThreadContext *thread_context) {
   // This latch has to also protect addition of this transaction to the running transaction table. Otherwise,
   // the thread might get scheduled out while other transactions commit, and the GC will deallocate their version
@@ -18,8 +46,13 @@ TransactionContext *TransactionManager::BeginTransaction(TransactionThreadContex
   auto *const result =
       new TransactionContext(start_time, start_time + INT64_MIN, buffer_pool_, log_manager_, thread_context);
   common::SpinLatch::ScopedSpinLatch running_guard(&curr_running_txns_latch_);
-  const auto ret UNUSED_ATTRIBUTE = curr_running_txns_.emplace(result->StartTime());
-  TERRIER_ASSERT(ret.second, "commit start time should be globally unique");
+  if (thread_context) {  // If the transaction is assigned to some worker
+    thread_context->BeginTransaction(result->StartTime());
+  } else {  // If the transaction is not assigned to any workers
+    const auto ret UNUSED_ATTRIBUTE = curr_running_txns_.emplace(result->StartTime());
+    TERRIER_ASSERT(ret.second, "commit start time should be globally unique");
+  }
+
   return result;
 }
 
@@ -87,7 +120,10 @@ timestamp_t TransactionManager::Commit(TransactionContext *const txn, transactio
                                        void *callback_arg) {
   const timestamp_t result = txn->undo_buffer_.Empty() ? ReadOnlyCommitCriticalSection(txn, callback, callback_arg)
                                                        : UpdatingCommitCriticalSection(txn, callback, callback_arg);
-  {
+  TransactionThreadContext *worker = txn->GetThreadContext();
+  if (worker) {  // If transaction is assigned to some worker
+    worker->Commit(txn);
+  } else {
     // In a critical section, remove this transaction from the table of running transactions
     common::SpinLatch::ScopedSpinLatch guard(&curr_running_txns_latch_);
     const timestamp_t start_time = txn->StartTime();
@@ -110,7 +146,10 @@ void TransactionManager::Abort(TransactionContext *const txn) {
   // Discard the redo buffer that is not yet logged out
   txn->redo_buffer_.Finalize(false);
   txn->log_processed_ = true;
-  {
+  TransactionThreadContext *worker = txn->GetThreadContext();
+  if (worker) {
+    worker->Abort(txn);
+  } else {
     // In a critical section, remove this transaction from the table of running transactions
     common::SpinLatch::ScopedSpinLatch guard(&curr_running_txns_latch_);
     const timestamp_t start_time = txn->StartTime();
@@ -155,16 +194,41 @@ void TransactionManager::GCLastUpdateOnAbort(TransactionContext *const txn) {
 }
 
 timestamp_t TransactionManager::OldestTransactionStartTime() const {
-  common::SpinLatch::ScopedSpinLatch guard(&curr_running_txns_latch_);
-  const auto &oldest_txn = std::min_element(curr_running_txns_.cbegin(), curr_running_txns_.cend());
-  const timestamp_t result = (oldest_txn != curr_running_txns_.end()) ? *oldest_txn : time_.load();
+  // Needs to compare transactions assigned to workers and those not
+  timestamp_t result;
+  {  // From transactions not assigned to workers
+    common::SpinLatch::ScopedSpinLatch guard(&curr_running_txns_latch_);
+    const auto &oldest_txn = std::min_element(curr_running_txns_.cbegin(), curr_running_txns_.cend());
+    result = (oldest_txn != curr_running_txns_.end()) ? *oldest_txn : time_.load();
+  }
+  {  // From transactions assgined to workers
+    common::SpinLatch::ScopedSpinLatch guard(&worker_list_latch_);
+    for (auto item : worker_list_) {
+      std::optional<timestamp_t> worker_result = item.second->OldestTransactionStartTime();
+      if (worker_result.has_value()) {
+        result = std::min(worker_result.value(), result);
+      }
+    }
+  }
   return result;
 }
 
 TransactionQueue TransactionManager::CompletedTransactionsForGC() {
-  common::SpinLatch::ScopedSpinLatch guard(&curr_running_txns_latch_);
-  TransactionQueue hand_to_gc(std::move(completed_txns_));
-  TERRIER_ASSERT(completed_txns_.empty(), "TransactionManager's queue should now be empty.");
+  TransactionQueue hand_to_gc;
+  {
+    common::SpinLatch::ScopedSpinLatch guard(&curr_running_txns_latch_);
+    hand_to_gc = std::move(completed_txns_);
+    TERRIER_ASSERT(completed_txns_.empty(), "TransactionManager's queue should now be empty.");
+  }
+  {  // Collected completed transactions from all workers
+    common::SpinLatch::ScopedSpinLatch guard(&worker_list_latch_);
+    for (auto worker : worker_list_) {
+      TransactionQueue worker_completed_txns = worker.second->SubmitCompletedTransactions();
+      for (auto txn : worker_completed_txns) {
+        hand_to_gc.emplace_front(txn);
+      }
+    }
+  }
   return hand_to_gc;
 }
 
